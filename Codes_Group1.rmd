@@ -1,0 +1,692 @@
+---
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# R code and output
+
+
+# Load the library needed
+
+```{r,warning=FALSE}
+library(tidyverse)
+library(astsa)
+library(leaps)
+library(MASS)
+library(glmnet)
+```
+
+# Load the data set
+
+```{r}
+traffic <- read.csv("Data_Group1.csv")
+```
+
+# Data Cleaning
+
+```{r}
+# we pick the first junction to consider since all junction are basically the same
+traffic <- subset(traffic, traffic$Junction == 1)
+# The data collected is a hourly data, we transform the data into a daily data 
+# since that's what we are interested in
+
+# Add the number of day column so later it will be easier to margin
+traffic$day_num <- rep(1:(dim(traffic)[1]/24),each = 24)
+```
+
+```{r}
+traffic <- traffic %>%
+  group_by(day_num) %>%
+  summarise(across(Vehicles, sum))
+# We start in the 2015.11.1 which is a Sunday, we call it week 1
+# The end is in 2017.6.30 which is a Friday
+traffic <- traffic[,2]%>%
+  ts(start=1+(6/7),frequency = 7) 
+```
+
+```{r}
+start(traffic);end(traffic);head(traffic)
+```
+
+After checking, the data indeed ends in a Friday, so there is no mistake in the data cleaning part.
+
+# Model Observing
+
+```{r}
+plot(traffic,main = "Plot of the traffic")
+```
+
+First of all, we can observe a clear non-constant variance and a increasing trend. But as for the seasonality, the data is a bit larger, so we may need to take a slice to get a taste of the data.
+
+```{r}
+plot(head(traffic, 350),type="l", main="Slice of the first 350 datas", xlab = "data", ylab = "Vehicles")
+```
+
+Now we can see a clear seasonality.
+
+We reconfirm non constant variance using fligner test.
+
+```{r}
+seg <- factor(c(rep(1:16,each=38)))
+fligner.test(traffic, seg)
+```
+The p-value is very small. so the variance is not constant.
+
+We reconfirm both trend and seasonality using acf plot.
+
+```{r}
+acf(traffic,main="")
+```
+
+A clear linear decay and periodic behavior, so both trend and seasonality are present.
+
+All the conclusion above means for future models, we may need to account for non-constant variance, trend and seasonality.
+
+# Stablize Variance
+
+We need to first stabilize the variance.
+
+```{r}
+seg <- factor(c(rep(1:16,each=38)))
+
+maxp = 0
+maxi = -10
+for (i in seq(-10,10,by=0.1)){
+  if (i != 0) tempp <- fligner.test(traffic^i, seg)$p.value
+  else tempp <- fligner.test(log(traffic), seg)$p.value
+  if (tempp >= maxp) {maxp = tempp; maxi = i;}
+}
+maxp; maxi
+```
+```{r}
+trans.traffic <- log(traffic)
+plot(trans.traffic)
+plot(head(trans.traffic, 350),type="l", main="Slice of the first 350 datas", xlab = "data", ylab = "Vehicles")
+hist(trans.traffic,breaks=30)
+fligner.test(trans.traffic, seg)
+```
+
+We use the log transformation to stabilize the variance. (p-value being the largest doesn't mean the best transformation, but the plot and Fligner's test seems to show a constant variance, the histogram seems a bit asymmetric, but it's fine, so we will go with this value)
+
+# Using Classic Decomposition (Moving average filter) to check for trend and seasonality again
+
+First we try both additive and multiplicative classic decomposition.
+
+```{r}
+decomadd <- decompose(trans.traffic, type="additive")
+decommult <- decompose(trans.traffic, type="multiplicative")
+```
+
+```{r}
+plot(decomadd);plot(decommult)
+```
+ 
+They looked fine! And we confirmed again that seasonality should be included since the seasonal part has a larger range than random part. But what about the residuals?
+
+```{r}
+par(mfrow=c(1,2))
+plot(decomadd$random)
+acf(na.omit(decomadd$random))
+
+par(mfrow=c(1,2))
+plot(decommult$random)
+acf(na.omit(decommult$random))
+```
+
+The difference between additive and multiplicative classic decomposition is not that significant, so we can pick either one, in this case, since additive is easier to interpret, we pick additive classic decomposition. We see stationary, so we once again confirmed that there is trend and seasonality.
+
+# Split the data
+
+First, we divide the data into train and test set since the data is time series and we want to chose model based on prediction power. We do a 80-20 split.
+
+```{r}
+traffic.train <- window(traffic,start = start(trans.traffic), end = 83)
+traffic.test <- window(traffic,start = 83+(1/7), end = end(trans.traffic))
+trans.traffic.train <- window(trans.traffic,start = start(trans.traffic), end = 83)
+trans.traffic.test <- window(trans.traffic,start = 83+(1/7), end = end(trans.traffic))
+train.i <- 1:569
+test.i <- 570:608
+```
+
+### Smoothing methods
+
+## Regression
+
+First, let's look at our good old friend, regression.
+
+We first set up the parameters we need for the regression.
+
+```{r}
+tim <- as.vector(time(trans.traffic))
+cly <- as.factor(cycle(time(trans.traffic)))
+timtr <- as.vector(time(trans.traffic.train))
+clytr <- as.factor(cycle(time(trans.traffic.train)))
+timte <- as.vector(time(trans.traffic.test))
+clyte <- as.factor(cycle(time(trans.traffic.test)))
+cly.matrix <- model.matrix(~cly-1)[,-1]
+clytr.matrix <- model.matrix(~-1)[,-1]
+clyte.matrix <- model.matrix(~clyte-1)[,-1]
+
+traffic.ds <- data.frame(trans.traffic,tim,cly)
+traffic.full.ds <- data.frame(trans.traffic,poly(tim,25),cly.matrix)
+```
+
+We first do a least square, no ridge, no LASSO.
+
+We choose the best model base on prediction error.
+
+```{r}
+MSE = c()
+for (i in 1:8) {
+  tempMSE = 0
+  templm <- lm(Vehicles~poly(tim,i)+cly,data=traffic.ds, subset = train.i)
+  temppre <- predict(templm, newdata = traffic.ds[test.i,])
+  MSE[i] <- mean((trans.traffic.test - temppre)^2)
+}
+plot(MSE,typ ="b")
+```
+```{r}
+which(MSE==min(MSE));min(MSE)
+```
+
+Base on prediction error, we picked the second order polynomial.
+
+Now we examine its residual.
+
+```{r}
+bestlm <- lm(Vehicles~poly(tim,2)+cly,data=traffic.ds, subset = train.i)
+bestlmfit <- ts(predict(bestlm),start=1+(6/7),frequency = 7)
+
+plot(trans.traffic.train,  main='Least Square Fit', 
+     ylab='log (vehicles)', xlab='Time')
+lines(bestlmfit,col="red")
+
+plot(traffic.train,  main='Least Square Fit', 
+     ylab='log (vehicles)', xlab='Time')
+lines(exp(bestlmfit),col="red")
+
+res <- bestlmfit - trans.traffic.train
+par(mfrow=c(1,2))
+plot(res)
+plot(res[100:160],type="l") # a random slice
+
+par(mfrow=c(1,1))
+acf(res)
+#pacf(res)
+
+# test error
+bestlmpre <- predict(bestlm, newdata = traffic.ds[test.i,])
+pre_error <- mean((bestlmpre - trans.traffic.test)^2)
+pre_error
+
+plot(head(trans.traffic.train, 250), type='l',  main='Least Square Fit', 
+     ylab='log (vehicles)', xlab='Time')
+lines(head(bestlmfit, 250),col="red")
+```
+
+We can see the acf seems to have a slow decay, which is a sign for trend, but such sign is not appearing in the plot of the residual, we are not so sure of the stationary of the residual.
+
+Now, what about some shrinkage method such as LASSO or ridge or elastic net based on prediction error?
+
+LASSO and Ridge and Elastic net!
+
+```{r}
+set.seed(1)
+p_max = 8
+min_p = rep(NA,11)
+min_lambda_p = rep(NA,11)
+min_error = rep(NA,11)
+for (a in seq(0,1,by=0.1)) {
+  min_lambda = rep(NA,p_max)
+  min_cv = rep(NA,p_max)
+  for (i in 2:p_max) {
+    tempXtr <- matrix(c(poly(tim,i),cly.matrix),ncol=i+6)[train.i,]
+    tempXte <- matrix(c(poly(tim,i),cly.matrix),ncol=i+6)[test.i,]
+    tempm <- glmnet(tempXtr, trans.traffic.train, alpha=a)
+    temppre <- predict(tempm, newx=tempXte,type="response")
+    tempMSE <- (temppre-as.vector(trans.traffic.test))^2
+    tempMSE <- apply(tempMSE, MARGIN=2,mean)
+    min_lambda[i] = tempm$lambda[tail(which(tempMSE==min(tempMSE)),n=1)]
+    min_cv[i] = min(tempMSE)
+  }
+  min_p[a*10+1] = tail(which(min_cv==min(min_cv[2:p_max])),n=1)
+  min_lambda_p[a*10+1] = min_lambda[min_p[a*10+1]]
+  min_error[a*10+1] = min(min_cv[2:p_max])
+}
+```
+
+```{r}
+par(mfrow=c(1,3))
+plot(seq(0,1,by=0.1),min_p,type="b", xlab="alpha", ylab="p")
+plot(seq(0,1,by=0.1),min_lambda_p,type="b", xlab="alpha", ylab="lambda_p")
+plot(seq(0,1,by=0.1),min_error,type="b", xlab="alpha", ylab="test error")
+```
+
+It's not worthwhile trying all the alpha values, so we will only try LASSO and $\alpha = 0.1$ to get a sense of the residuals.
+
+```{r}
+min_alpha = which(min_error == min(min_error))
+c(seq(0,1,by=0.1)[min_alpha], min_p[min_alpha],min_lambda_p[min_alpha],min_error[min_alpha])
+```
+
+LASSO!
+
+```{r}
+op_fit <- glmnet(matrix(c(poly(tim,2),cly.matrix),ncol=8)[train.i,], trans.traffic.train,
+                 alpha=1, lambda=min_lambda_p[11])
+Predicted = ts(predict(op_fit,newx=matrix(c(poly(tim,2),cly.matrix),ncol=8)),
+               start=1+(6/7), frequency = 7)
+
+res <- exp(Predicted)[train.i] - traffic[train.i]
+plot(res,type="l")
+acf(res)
+
+# test error
+pre_error <- mean((Predicted[test.i] - as.vector(trans.traffic.test))^2)
+pre_error
+
+plot(traffic, main='Lasso fit',
+     ylab='log (vehicles)', xlab='Time')
+lines(exp(Predicted),col="red")
+abline(v=83,col="blue",lty=2)
+```
+Similar to second order simple regression......
+
+```{r}
+# plot of the first 250 data
+plot(head(trans.traffic.train, 250),type = "l", main='Lasso fit',
+     ylab='log (vehicles)', xlab='Time')
+lines(head(Predicted, 250), col= "red")
+```
+
+Since the residual seems th be similar, we pick the simplest model which is the second order simple regression in the regression part even through the test error is a bit higher.
+
+# SARIMA analysis for residual of regression.
+
+Of all the regression model we analysed that have good prediction power, the residual all have similar looks, we will pick one that's the most simple (a happy coincidence that the test error is also the smallest) by parsimony rule, i.e., the second order simple linear regression. 
+
+```{r}
+# the model once again...
+bestlm <- lm(Vehicles~poly(tim,2)+cly,data=traffic.ds, subset = train.i)
+bestlmfit <- ts(predict(bestlm),start=1+(6/7),frequency = 7)
+
+lmres <- bestlmfit - trans.traffic[train.i]
+par(mfrow=c(1,1))
+plot(lmres)
+acf(lmres)
+```
+
+We are not sure if the acf of the residual showed a slow decay or a exponential decay, so we will try both a first order differencing and no differencing.
+
+```{r}
+# no differencing
+plot(head(lmres,250), type="l", ylab='residuals', xlab='Time')
+par(mfrow=c(1,2))
+acf(lmres)
+pacf(lmres)
+```
+
+If we treat the acf as exponential decay, we can either treat the pacf as a slow decay or the pacf as 0 after 2.
+So we have 2 ARMA models. One being ARMA(1,1), the other being ARMA(2,0).
+
+```{r}
+sarima(lmres,p=1, d=0, q=1 , P=0, D=0, Q=0, S=0, details = TRUE)
+sarima(lmres,p=2, d=0, q=0 , P=0, D=0, Q=0, S=0, details = TRUE)
+```
+
+Both model looks fine except for normality.
+
+What about having one time differencing?
+
+```{r}
+# first order differencing
+diffr1 <-diff(lmres) 
+plot(diff(lmres), type="l")
+plot(head(diff(lmres), 250), type="l", ylab='residuals', xlab='Time')
+par(mfrow=c(1,2))
+acf(diffr1)
+pacf(diffr1)
+```
+
+Now we can treat the acf as either 0 after 1 or a fast damped sine wave. We can treat the pacf as a exponential decay or 0 after 6. So that in total gives us 3 ARIMA models. Which are ARIMA(1,1,1), ARIMA(0,1,1) and ARIMA(6,1,0).
+
+```{r}
+sarima(lmres,p=1, d=1, q=1 , P=0, D=0, Q=0, S=0, details = TRUE)
+sarima(lmres,p=0, d=1, q=1 , P=0, D=0, Q=0, S=0, details = TRUE)
+sarima(lmres,p=6, d=1, q=0 , P=0, D=0, Q=0, S=0, details = TRUE)
+```
+
+Only the ARIMA(1,1,1) looked fine.
+
+So we can leave regression with the following 4 models.
+1. Second order regression + ARMA(1,1)
+2. Second order regression + ARMA(2,0)
+3. Second order regression + ARIMA(1,1,1)
+4. Second order regression + ARIMA(6,1,0)
+
+## Holt Winters (Expoential Smoothing)
+
+How about Holt Winters?
+
+```{r}
+adHW <- HoltWinters(trans.traffic.train, seasonal = c("additive"))
+
+muHW <- HoltWinters(trans.traffic.train, seasonal = c("multiplicative"))
+
+plot(adHW$x[1:250], ylab = "Transformed Traffic Volume")
+lines(adHW$fitted[1:250], col = "blue", lwd = 2)
+lines(muHW$fitted[1:250], col = "red", lwd = 1)
+legend("bottomright", legend=c("Additive", "Multiplicative"),
+       col=c("blue", "red"), lty=1:1)
+plot(adHW);plot(muHW)
+```
+
+```{r}
+resadHW <- trans.traffic[c(8:length(trans.traffic.train))]-adHW$fitted[,1]
+plot(resadHW)
+acf(resadHW)
+
+resmuHW <- trans.traffic[c(8:length(trans.traffic.train))]-muHW$fitted[,1]
+plot(resmuHW)
+acf(resmuHW)
+```
+
+The residual looks the same, so we can randomly pick one, in this case, we still pick the additive model.
+
+# SARIMA analysis
+
+```{r}
+HW.res <- resadHW
+plot(HW.res[1:250], type="l", ylab="residual")
+plot(HW.res)
+par(mfrow=c(1,2))
+acf(HW.res);pacf(HW.res)
+```
+There are several models we can propose for this model, and since the acf and pacf are not significant at lag of period, instead of proposing SARIMA, we propose ARIMA (and since stationary, we only have ARMA):
+
+1. We might think both the acf and pacf have damped sine wave, so we have ARMA(1,1), or maybe ARMA(1,2), ARMA(2,1), ARMA(2,2)
+
+2. We might think the acf has damped sine wave, the pacf is 0 after lag 4, so we have AR(4)
+
+3. We might think the pacf has damped sine wave, the acf is 0 after lag 4, so we have MA(4) 
+
+
+```{r}
+Model1 <- sarima(HW.res, p=1, d=0, q=1 , P=0, D=0, Q=0, S=0 , details = TRUE)
+Model12 <- sarima(HW.res, p=1, d=0, q=2 , P=0, D=0, Q=0, S=0, details = TRUE)
+Model13 <- sarima(HW.res, p=2, d=0, q=1 , P=0, D=0, Q=0, S=0 , details = TRUE)
+Model14 <- sarima(HW.res, p=2, d=0, q=2 , P=0, D=0, Q=0, S=0 , details = TRUE)
+Model2 <- sarima(HW.res, p=4, d=0, q=0 , P=0, D=0, Q=0, S=0 , details = TRUE)
+Model3 <- sarima(HW.res, p=0, d=0, q=4 , P=0, D=0, Q=0, S=0 , details = TRUE)
+```
+
+For HW, we can pick 
+1. additive HW + ARMA(1,2)
+2. additive HW + ARMA(2,1)
+3. additive HW + ARMA(2,2)
+4. additive HW + AR(4)
+5. additive HW + MA(4)
+
+
+## Differencing
+
+```{r}
+diff1<- diff(trans.traffic.train)
+acf(diff1)
+```
+
+We can see that there is a periodic pattern, so first order differencing with lag 1 is probably not enough.
+
+```{r}
+diff7<- diff(trans.traffic.train,lag=7)
+acf(diff7)
+```
+
+We are not sure if this is a damped sine wave or this is a slow decay, so either we have reached stationary or first order differencing with lag 7 is probably not enough.
+
+Let's first assume we have reached stationary.
+
+```{r}
+par(mfrow=c(1,2))
+acf(diff7);pacf(diff7)
+```
+
+Ignoring seasonal lag, acf -> damped sine wave, pacf -> damped sine wave
+
+On the seasonal lag, acf >- exponential decay / cut off after 1, pacf -> damped sine wave
+
+
+SARIMA(1,0,1)  (1,1,1)
+
+SARIMA(1,0,1)  (0,1,1)
+
+
+```{r}
+Model4 <- sarima(trans.traffic.train, p=1, d=0, q=1 , P=1, D=1, Q=1, S=7 , details = TRUE)
+Model5 <- sarima(trans.traffic.train, p=1, d=0, q=1 , P=0, D=1, Q=1, S=7 , details = TRUE)
+```
+
+
+Then we assume first order differencing is not enough, let's try second order.
+
+```{r}
+diff17<- diff(diff(trans.traffic.train),lag=7)
+plot(diff17)
+plot(diff17[100:300],type="l")
+plot(diff17,type="p")
+acf(diff17)
+```
+
+```{r}
+seg <- factor(c(rep(1:10,each=60)))
+hist(diff17)
+fligner.test(diff17[1:600], seg)
+```
+
+Stationary!
+
+# SARIMA analysis
+
+```{r}
+Diff.res <- diff17
+par(mfrow=c(1,2))
+acf(Diff.res);pacf(Diff.res)
+```
+There are several models we can propose for this model:
+
+
+1. We might think both the acf and pacf have damped sine wave ignoring the data at the period. 
+And the acf is 0 after 1, the pacf is expoential decay only look at the data at the period. 
+so we have $SARIMA(1,1,1)\times(0,1,1)_7$.
+
+2. We might think the acf is 0 after 1, the pacf is damped sine wave ignoring the data at the period.
+And the acf is 0 after 1, the pacf is expoential decay only look at the data at the period. 
+so we have $SARIMA(0,1,1)\times(0,1,1)_7$.
+
+3. We might think the acf is 0 after 6, the pacf is damped sine wave ignoring the data at the period.
+And the acf is 0 after 1, the pacf is expoential decay only look at the data at the period. 
+so we have $SARIMA(0,1,6)\times(0,1,1)_7$.
+
+```{r}
+Model1 <- sarima(trans.traffic.train, p=1, d=1, q=1 , P=0, D=1, Q=1, S=7 , details = TRUE)
+Model2 <- sarima(trans.traffic.train, p=0, d=1, q=1 , P=0, D=1, Q=1, S=7 , details = TRUE)
+Model3 <- sarima(trans.traffic.train, p=0, d=1, q=6 , P=0, D=1, Q=1, S=7 , details = TRUE)
+```
+
+For differencing, we pick $SARIMA(1,1,1)\times(0,1,1)_7$ and $SARIMA(0,1,6)\times(0,1,1)_7$.
+
+# Prediction
+
+So we have in total picked 13 models.
+1. Second order regression + ARMA(1,1)
+2. Second order regression + ARMA(2,0)
+3. Second order regression + ARIMA(1,1,1)
+4. Second order regression + ARIMA(6,1,0)
+5. additive HW + ARMA(1,2)
+6. additive HW + ARMA(2,1)
+7. additive HW + ARMA(2,2)
+8. additive HW + AR(4)
+9. additive HW + MA(4)
+10. $SARIMA(1,1,1)\times(0,1,1)_7$
+11. $SARIMA(0,1,6)\times(0,1,1)_7$
+12. $SARIMA(1,0,1) \times (1,1,1)_7$
+13. $SARIMA(1,0,1) \times (0,1,1)_7$
+
+We will pick the one with the smallest prediction error (if similar prediction error occurred, we may need to aid of fitting power as well).
+
+```{r}
+# regression again
+bestlm <- lm(Vehicles~poly(tim,2)+cly,data=traffic.ds, subset = train.i)
+bestlmpre <- predict(bestlm, newdata = traffic.ds[test.i,])
+bestlmfit <- ts(predict(bestlm),start=1+(6/7),frequency = 7)
+bestlmres <- bestlmfit - trans.traffic[train.i]
+```
+
+```{r}
+M1r <- sarima.for(bestlmres, n.ahead = 39, p=1, d=0, q=1 , P=0, D=0, Q=0, S=0)
+M2r <- sarima.for(bestlmres, n.ahead = 39, p=2, d=0, q=0 , P=0, D=0, Q=0, S=0)
+M3r <- sarima.for(bestlmres, n.ahead = 39, p=1, d=1, q=1 , P=0, D=0, Q=0, S=0)
+M4r <- sarima.for(bestlmres, n.ahead = 39, p=6, d=1, q=0 , P=0, D=0, Q=0, S=0)
+```
+
+
+```{r}
+M1pre <- bestlmpre + M1r$pred
+M2pre <- bestlmpre + M2r$pred
+M3pre <- bestlmpre + M3r$pred
+M4pre <- bestlmpre + M4r$pred
+```
+
+
+```{r}
+# additive HW
+adHW <- HoltWinters(trans.traffic.train, seasonal = c("additive"))
+adHWpre <- predict(adHW, n.ahead = 130)
+adHWres <- trans.traffic[c(8:length(trans.traffic.train))]-adHW$fitted[,1]
+```
+
+```{r}
+M5r <- sarima.for(adHWres, n.ahead = 39, p=1, d=0, q=2 , P=0, D=0, Q=0, S=0)
+M6r <- sarima.for(adHWres, n.ahead = 39, p=2, d=0, q=1 , P=0, D=0, Q=0, S=0)
+M7r <- sarima.for(adHWres, n.ahead = 39, p=2, d=0, q=2 , P=0, D=0, Q=0, S=0)
+M8r <- sarima.for(adHWres, n.ahead = 39, p=4, d=0, q=0 , P=0, D=0, Q=0, S=0)
+M9r <- sarima.for(adHWres, n.ahead = 39, p=0, d=0, q=4 , P=0, D=0, Q=0, S=0)
+```
+
+```{r}
+M5pre <- adHWpre + M5r$pred
+M6pre <- adHWpre + M6r$pred
+M7pre <- adHWpre + M7r$pred
+M8pre <- adHWpre + M8r$pred
+M9pre <- adHWpre + M9r$pred
+```
+
+```{r}
+# differencing
+M10m <- sarima.for(trans.traffic.train, n.ahead = 39, p=1, d=1, q=1 , P=0, D=1, Q=1, S=7,plot.all = F)
+M11m <- sarima.for(trans.traffic.train, n.ahead = 39, p=0, d=1, q=6 , P=0, D=1, Q=1, S=7,plot.all = F)
+M12m <- sarima.for(trans.traffic.train, n.ahead = 39, p=1, d=0, q=1 , P=1, D=1, Q=1, S=7,plot.all = F)
+M13m <- sarima.for(trans.traffic.train, n.ahead = 39, p=1, d=0, q=1 , P=0, D=1, Q=1, S=7,plot.all = F)
+```
+
+```{r}
+M10pre <- M10m$pred
+M11pre <- M11m$pred
+M12pre <- M12m$pred
+M13pre <- M13m$pred
+```
+
+```{r}
+#test error (test MSE)
+M1MSE <- mean((exp(M1pre) - traffic.test)^2)
+M2MSE <- mean((exp(M2pre) - traffic.test)^2)
+M3MSE <- mean((exp(M3pre) - traffic.test)^2)
+M4MSE <- mean((exp(M4pre) - traffic.test)^2)
+M5MSE <- mean((exp(M5pre) - traffic.test)^2)
+M6MSE <- mean((exp(M6pre) - traffic.test)^2)
+M7MSE <- mean((exp(M7pre) - traffic.test)^2)
+M8MSE <- mean((exp(M8pre) - traffic.test)^2)
+M9MSE <- mean((exp(M9pre) - traffic.test)^2)
+M10MSE <- mean((exp(M10pre) - traffic.test)^2)
+M11MSE <- mean((exp(M11pre) - traffic.test)^2)
+M12MSE <- mean((exp(M12pre) - traffic.test)^2)
+M13MSE <- mean((exp(M13pre) - traffic.test)^2)
+```
+
+```{r}
+allMSE <- c(M1MSE, M2MSE, M3MSE, M4MSE, M5MSE, M6MSE, M7MSE, M8MSE, M9MSE,M10MSE,M11MSE,M12MSE,M13MSE)
+plot(allMSE, xlab = "Models", ylim=c(9000,65000),pch=19,xaxt="n",ylab="test MSE")
+segments(x0= 1:13, y0=c(rep(0,13)), x1 = 1:13, y1 = allMSE)
+text(x=1:13, y= allMSE+2000, labels = round(allMSE),cex=0.8)
+axis(1, at = 1:13, labels=1:13)
+```
+```{r}
+which(allMSE == min(allMSE));allMSE[which(allMSE == min(allMSE))]
+```
+
+Even through modle 11 has a smaller test error, it has 4 more parameter compated to model 10, so we picked model 10, $SARIMA(0,1,6)\times(0,1,1)_7$,  which has a slight larger test error but less paramter.
+
+# Winner!
+
+```{r}
+#we predict 2 months
+the_future_time <- seq(88+(5/7), 97+(3/7), by = 1/7)
+the_future_cly <- as.factor(c(c(6, 7), rep(1:7, 8), 1:4))
+the_future <- data.frame(tim = the_future_time, cly = the_future_cly)
+the_chosen_one <- sarima.for(trans.traffic, n.ahead = 62, p=1, d=1, q=1 , P=0, D=1, Q=1, S=7,plot.all = T)
+```
+
+```{r}
+fit <- the_chosen_one$pred
+lower <- the_chosen_one$pred - 1.96 * (the_chosen_one$se)
+upper <- the_chosen_one$pred + 1.96 * (the_chosen_one$se)
+plot_part <- window(traffic,start = 30+(1/7), end = end(trans.traffic))
+plot(plot_part, xlim = c(30, 98), ylim=c(600,3600))
+lines(exp(fit), col = "red")
+polygon(c(the_future_time, rev(the_future_time)), c(exp(lower), rev(exp(upper))), col= "#80808060", border=NA)
+```
+```{r}
+plot(traffic, xlim = c(0, 98), ylim=c(300,3600))
+lines(exp(fit), col = "red")
+polygon(c(the_future_time, rev(the_future_time)), c(exp(lower), rev(exp(upper))), col= "#80808060", border=NA)
+```
+```{r}
+# the first 7 prediction with a below 95% CI
+ds <- data.frame(fit = exp(fit), upper = exp(upper), lower = exp(lower))
+knitr::kable(ds[1:7,])
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
